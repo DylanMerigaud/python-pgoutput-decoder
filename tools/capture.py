@@ -196,6 +196,9 @@ def _exec(cur: Any, sql: str) -> None:
 def run_scenario(conn: Any, scenario: Scenario) -> Dict[str, Any]:
     """Run one scenario on an autocommit psycopg2 connection; return the fixture dict."""
     cur = conn.cursor()
+    # Text output of timestamptz follows the session's TimeZone: pin it so every capture of a
+    # scenario holds the same bytes.
+    cur.execute("SET TimeZone = 'UTC'")
     cur.execute("SHOW server_version_num")
     version = int(cur.fetchone()[0])
     _exec(cur, SCHEMA)

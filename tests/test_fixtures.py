@@ -220,11 +220,16 @@ def test_basic_scenario(path: str) -> None:
 def test_origin_scenario(path: str) -> None:
     _, msgs = load(path)
     m = [x for _, _, x in msgs]
-    (origin,) = [x for x in m if isinstance(x, Origin)]
+    # PostgreSQL 14 also sends the session's empty transactions (15+ skips them): find the one
+    # holding the insert.
+    i = next(n for n, x in enumerate(m) if isinstance(x, Insert))
+    begin = max((x for x in m[:i] if isinstance(x, Begin)), key=m.index)
+    origin = max((x for x in m[:i] if isinstance(x, Origin)), key=m.index)
+    assert m.index(begin) < m.index(origin)
     assert origin.name == "pgo_origin"
     assert origin.commit_lsn == parse_lsn("0/ABCDEF")
-    (begin,) = [x for x in m if isinstance(x, Begin)]
     assert begin.commit_time == datetime(2024, 5, 6, 7, 8, 9, tzinfo=timezone.utc)
+    assert all(x.name == "pgo_origin" for x in m if isinstance(x, Origin))
 
 
 def _inserts(m: List[Any]) -> int:
@@ -238,10 +243,11 @@ def test_stream_scenario(path: str) -> None:
     starts = [x for x in m if isinstance(x, StreamStart)]
     assert starts and starts[0].first_segment
     aborts = [x for x in m if isinstance(x, StreamAbort)]
-    # The savepoint rolled back (subxid differs) and the whole transaction rolled back.
-    assert len(aborts) == 2
+    # The savepoint rolled back (subxid differs), then the whole second transaction, which a
+    # server may also drop unsent once it sees the abort (PostgreSQL 18 does).
+    assert len(aborts) in (1, 2)
     assert aborts[0].subxid != aborts[0].xid
-    assert aborts[1].subxid == aborts[1].xid
+    assert all(a.subxid == a.xid for a in aborts[1:])
     assert all(a.abort_lsn is None for a in aborts)
     (commit,) = [x for x in m if isinstance(x, StreamCommit)]
     assert commit.xid == starts[0].xid
@@ -260,7 +266,7 @@ def test_stream_scenario(path: str) -> None:
 def test_stream_parallel_scenario(path: str) -> None:
     _, msgs = load(path)
     aborts = [x for _, _, x in msgs if isinstance(x, StreamAbort)]
-    assert len(aborts) == 2
+    assert len(aborts) in (1, 2)  # the full abort may be dropped unsent (18)
     for a in aborts:
         assert a.abort_lsn is not None and a.abort_lsn > 0
         assert a.abort_time is not None and a.abort_time.year >= 2024
