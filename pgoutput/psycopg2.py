@@ -11,9 +11,9 @@ package: this module takes the cursor you created.
     conn = psycopg2.connect(dsn, connection_factory=psycopg2.extras.LogicalReplicationConnection)
     cur = conn.cursor()
     start(cur, "my_slot", "my_pub", proto_version=2, streaming=True)
-    for event in events(cur):
+    for event in events(cur, ack_idle=True):
         handle(event.message)
-        if isinstance(event.message, Commit):
+        if isinstance(event.message, (Commit, StreamCommit)):
             ack(cur, event.message.end_lsn)
 """
 
@@ -23,9 +23,20 @@ import select
 import time
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Iterable, Iterator, Optional, Union
+from typing import Any, Iterable, Iterator, Optional, Set, Union
 
-from .core import Decoder, Message
+from .core import (
+    Begin,
+    BeginPrepare,
+    Commit,
+    Decoder,
+    Message,
+    Prepare,
+    StreamAbort,
+    StreamCommit,
+    StreamPrepare,
+    StreamStart,
+)
 
 __all__ = ["Event", "start", "events", "ack"]
 
@@ -69,27 +80,52 @@ def events(
     *,
     idle_timeout: Optional[float] = None,
     poll_interval: float = 1.0,
+    ack_idle: bool = False,
 ) -> Iterator[Event]:
     """Yield each decoded message as it arrives. Keepalives and status updates are handled by
     psycopg2 inside ``read_message``. With ``idle_timeout``, stop after that many seconds
-    without a message; without it, run until the connection closes."""
+    without a message; without it, run until the connection closes.
+
+    ``ack_idle``: when ``poll_interval`` passes with no message and no transaction is open
+    (every Begin, Begin Prepare and streamed transaction received so far has reached its
+    Commit, Prepare, Stream Commit, Stream Prepare or Stream Abort), acknowledge
+    ``cursor.wal_end``. Use it when you apply each message before reading the next one: it keeps
+    the slot moving on a quiet publication (see ``ack``)."""
     dec = decoder if decoder is not None else Decoder()
     last = time.monotonic()
+    in_tx = False
+    streams: Set[int] = set()
     while True:
         msg = cursor.read_message()
         if msg is not None:
             last = time.monotonic()
-            yield Event(dec.decode(msg.payload), msg.data_start, msg.wal_end, msg.send_time)
+            message = dec.decode(msg.payload)
+            if isinstance(message, (Begin, BeginPrepare)):
+                in_tx = True
+            elif isinstance(message, (Commit, Prepare)):
+                in_tx = False
+            elif isinstance(message, StreamStart):
+                streams.add(message.xid)
+            elif isinstance(message, (StreamCommit, StreamPrepare)) or (
+                isinstance(message, StreamAbort) and message.subxid == message.xid
+            ):
+                streams.discard(message.xid)
+            yield Event(message, msg.data_start, msg.wal_end, msg.send_time)
             continue
         if idle_timeout is not None and time.monotonic() - last >= idle_timeout:
             return
-        select.select([cursor], [], [], poll_interval)
+        ready, _, _ = select.select([cursor], [], [], poll_interval)
+        if not ready and ack_idle and not in_tx and not streams and cursor.wal_end:
+            ack(cursor, cursor.wal_end)
 
 
 def ack(cursor: Any, lsn: int) -> None:
     """Tell the server everything up to ``lsn`` is safely stored: the slot may release that WAL.
 
-    Acknowledge the ``end_lsn`` of a Commit (or Stream Commit, Commit Prepared) once its
-    changes are durable on your side, never a position inside a transaction you have not
-    finished applying."""
+    Acknowledge the ``end_lsn`` of a Commit, Stream Commit or Commit Prepared once its changes
+    are durable on your side, never a position inside a transaction you have not finished
+    applying. Since PostgreSQL 15 the server skips transactions that touch no published table,
+    so a quiet publication on a busy server sends no Commit at all: when every transaction you
+    received is applied, also acknowledge ``cursor.wal_end`` (updated by keepalives), or the
+    slot keeps that WAL on disk. ``events(..., ack_idle=True)`` does that."""
     cursor.send_feedback(write_lsn=lsn, flush_lsn=lsn)

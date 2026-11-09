@@ -24,7 +24,16 @@ sys.path.insert(0, str(ROOT / "tools"))
 
 import test_fixtures as checks  # noqa: E402
 
-from pgoutput import Commit, Decoder, Insert, Relation, parse_lsn  # noqa: E402
+from pgoutput import (  # noqa: E402
+    Commit,
+    Decoder,
+    Insert,
+    Relation,
+    StreamCommit,
+    StreamStart,
+    StreamStop,
+    parse_lsn,
+)
 from pgoutput.sql import read_changes  # noqa: E402
 
 psycopg2 = pytest.importorskip("psycopg2")
@@ -161,3 +170,104 @@ def test_sql_with_psycopg3() -> None:
             assert ins.new[0].data == (5).to_bytes(4, "big")
         finally:
             cur.execute("SELECT pg_drop_replication_slot(%s)", (slot,))
+
+
+def test_sql_with_asyncpg_and_upto_lsn() -> None:
+    asyncpg = pytest.importorskip("asyncpg")
+    import asyncio
+
+    from pgoutput.sql import changes_query, decode_rows
+
+    slot = "pgo_live_asyncpg"
+    setup = psycopg2.connect(DSN)
+    setup.autocommit = True
+    cur = setup.cursor()
+    _fresh_table(cur, slot)
+    cur.execute("SELECT pg_create_logical_replication_slot(%s, 'pgoutput')", (slot,))
+    cur.execute("INSERT INTO pgo_live VALUES (1, 'one')")
+    cur.execute("SELECT pg_current_wal_lsn()::text")
+    between = parse_lsn(cur.fetchone()[0])
+    cur.execute("INSERT INTO pgo_live VALUES (2, 'two')")
+
+    async def read(upto: Any) -> Any:
+        conn = await asyncpg.connect(_asyncpg_dsn())
+        try:
+            sql, params = changes_query(slot, "pgo_live_pub", upto_lsn=upto, paramstyle="numeric")
+            return decode_rows(await conn.fetch(sql, *params))
+        finally:
+            await conn.close()
+
+    try:
+        first = asyncio.run(read(between))
+        everything = asyncio.run(read(None))
+        assert [c.message.new[1].text() for c in first if isinstance(c.message, Insert)] == ["one"]
+        assert [c.message.new[1].text() for c in everything if isinstance(c.message, Insert)] == [
+            "one",
+            "two",
+        ]
+    finally:
+        _drop_slot(setup.cursor(), slot)
+        setup.close()
+
+
+def _asyncpg_dsn() -> str:
+    parts = dict(p.split("=", 1) for p in (DSN or "").split())
+    return (
+        f"postgresql://{parts.get('user', 'postgres')}@{parts.get('host', '127.0.0.1')}:"
+        f"{parts.get('port', '5432')}/{parts.get('dbname', 'postgres')}"
+    )
+
+
+def test_sql_streamed_batches(conn: Any) -> None:
+    """With streaming, a batch can stop after a Stream Stop; the next call sends the
+    uncommitted transaction again from its first block, and a read without a limit gets it
+    whole."""
+    slot = "pgo_live_sql_stream"
+    cur = conn.cursor()
+    _fresh_table(cur, slot)
+    cur.execute("SELECT pg_create_logical_replication_slot(%s, 'pgoutput')", (slot,))
+    opts: Any = {"proto_version": 2, "streaming": True}
+    try:
+        cur.execute(
+            "INSERT INTO pgo_live SELECT g, repeat(md5(g::text), 16) FROM generate_series(1, 400) g"
+        )
+        cur.execute("SET logical_decoding_work_mem = '64kB'")
+        first = read_changes(cur, slot, "pgo_live_pub", peek=False, upto_nchanges=5, **opts)
+        assert isinstance(first[-1].message, StreamStop)
+        second = read_changes(cur, slot, "pgo_live_pub", peek=False, upto_nchanges=5, **opts)
+        assert isinstance(second[0].message, StreamStart) and second[0].message.first_segment
+        first_row = next(c.message for c in second if isinstance(c.message, Insert))
+        assert first_row.new[0].text() == "1"
+        whole = read_changes(cur, slot, "pgo_live_pub", peek=False, **opts)
+        assert sum(isinstance(c.message, Insert) for c in whole) == 400
+        assert isinstance(whole[-1].message, StreamCommit)
+    finally:
+        cur.execute("RESET logical_decoding_work_mem")
+        _drop_slot(cur, slot)
+
+
+def test_binary_numeric_beyond_28_digits_live(conn: Any) -> None:
+    from decimal import Decimal
+
+    from pgoutput import Converter
+
+    slot = "pgo_live_numeric"
+    cur = conn.cursor()
+    _drop_slot(cur, slot)
+    cur.execute("DROP PUBLICATION IF EXISTS pgo_num_pub")
+    cur.execute("DROP TABLE IF EXISTS pgo_num")
+    cur.execute("CREATE TABLE pgo_num (id int PRIMARY KEY, v numeric(38, 10), a numeric[])")
+    cur.execute("CREATE PUBLICATION pgo_num_pub FOR TABLE pgo_num")
+    cur.execute("SELECT pg_create_logical_replication_slot(%s, 'pgoutput')", (slot,))
+    try:
+        cur.execute(
+            "INSERT INTO pgo_num VALUES (1, 1234567890123456789012345678.1234567891, "
+            "'{1.5,NULL,1e30}')"
+        )
+        changes = read_changes(cur, slot, "pgo_num_pub", binary=True)
+        (ins,) = [c.message for c in changes if isinstance(c.message, Insert)]
+        row = Converter().row(ins.relation, ins.new)
+        assert row["v"] == Decimal("1234567890123456789012345678.1234567891")
+        assert row["a"] == [Decimal("1.5"), None, Decimal("1E30")]
+    finally:
+        _drop_slot(cur, slot)

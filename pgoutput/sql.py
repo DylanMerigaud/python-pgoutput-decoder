@@ -41,8 +41,9 @@ def changes_query(
 
     ``peek=True`` leaves the slot where it is; ``peek=False`` (``get``) consumes the changes.
     ``paramstyle`` is ``"format"`` (``%s``: psycopg 3, psycopg2) or ``"numeric"`` (``$1``:
-    asyncpg). ``options`` go to ``plugin_options`` (``proto_version``, ``binary``,
-    ``messages``, ``streaming``, ``two_phase``, ``origin``).
+    asyncpg, which gets ``upto_lsn`` as an integer, the form its ``pg_lsn`` codec takes).
+    ``options`` go to ``plugin_options`` (``proto_version``, ``binary``, ``messages``,
+    ``streaming``, ``two_phase``, ``origin``).
     """
     opts = plugin_options(publications, **options)
     flat: List[str] = []
@@ -59,9 +60,13 @@ def changes_query(
         f"SELECT lsn::text, xid::text, data FROM {fn}"
         f"({marks[0]}, {marks[1]}::pg_lsn, {marks[2]}::int, VARIADIC {marks[3]}::text[])"
     )
+    # psycopg sends the LSN as text; asyncpg's pg_lsn codec takes the integer.
+    lsn_param: Union[int, str, None] = upto_lsn
+    if upto_lsn is not None and paramstyle == "format":
+        lsn_param = format_lsn(upto_lsn)
     params = [
         slot,
-        None if upto_lsn is None else format_lsn(upto_lsn),
+        lsn_param,
         upto_nchanges,
         flat,
     ]
@@ -93,8 +98,11 @@ def read_changes(
 ) -> List[Change]:
     """Run the changes function on a DB-API cursor (``%s`` placeholders) and decode the rows.
 
-    ``upto_nchanges`` counts transactions' changes as the server does: it stops after the
-    transaction in which the count is reached, so a batch never ends inside a transaction.
+    ``upto_nchanges`` is checked by the server after each transaction it decodes, so without
+    streaming a batch never ends inside a transaction. With ``streaming`` a batch can stop after
+    any Stream Stop, in the middle of a transaction that has not committed, and the slot cannot
+    move past it: the next call sends that transaction again from its first block. With this SQL
+    path, use ``streaming`` only without ``upto_nchanges``, or leave streaming off.
     """
     sql, params = changes_query(
         slot, publications, peek=peek, upto_lsn=upto_lsn, upto_nchanges=upto_nchanges, **options

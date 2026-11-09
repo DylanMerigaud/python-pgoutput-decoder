@@ -163,3 +163,69 @@ def test_ack_sends_feedback_for_write_and_flush():
     cur = FakeCursor()
     ack(cur, 0x16B374D848)
     assert cur.feedback_calls == [{"write_lsn": 0x16B374D848, "flush_lsn": 0x16B374D848}]
+
+
+def commit_payload(end_lsn=0x200):
+    return b"C" + struct.pack(">BQQq", 0, end_lsn - 8, end_lsn, 0)
+
+
+def stream_start(xid, first=1):
+    return b"S" + struct.pack(">IB", xid, first)
+
+
+def stream_abort(xid, subxid):
+    return b"A" + struct.pack(">II", xid, subxid)
+
+
+class IdleCursor(FakeCursor):
+    """A cursor whose script holds None for an idle poll; wal_end as keepalives set it."""
+
+    wal_end = 0x900
+
+    def read_message(self):
+        self.reads += 1
+        if not self.script:
+            raise StopIteration
+        return self.script.pop(0)
+
+
+def drain(cur, **kw):
+    out = []
+    try:
+        for e in events(cur, **kw):
+            out.append(e)
+    except RuntimeError:  # StopIteration from the fake cursor inside the generator
+        pass
+    return out
+
+
+def test_ack_idle_acknowledges_wal_end_between_transactions(selects):
+    cur = IdleCursor([None, message(begin_payload()), None, message(commit_payload()), None])
+    drain(cur, ack_idle=True)
+    # Idle before the transaction and after its commit, never while it is open.
+    assert cur.feedback_calls == [
+        {"write_lsn": 0x900, "flush_lsn": 0x900},
+        {"write_lsn": 0x900, "flush_lsn": 0x900},
+    ]
+
+
+def test_ack_idle_waits_for_an_open_streamed_transaction(selects):
+    cur = IdleCursor(
+        [
+            message(stream_start(5)),
+            message(b"E"),
+            None,  # between blocks: the streamed transaction is still open
+            message(stream_abort(5, 6)),  # a savepoint only
+            None,
+            message(stream_abort(5, 5)),  # the whole transaction
+            None,
+        ]
+    )
+    drain(cur, ack_idle=True)
+    assert cur.feedback_calls == [{"write_lsn": 0x900, "flush_lsn": 0x900}]
+
+
+def test_no_ack_without_ack_idle(selects):
+    cur = IdleCursor([None, None])
+    drain(cur)
+    assert cur.feedback_calls == []

@@ -245,6 +245,15 @@ def test_stream_scenario(path: str) -> None:
     assert all(a.abort_lsn is None for a in aborts)
     (commit,) = [x for x in m if isinstance(x, StreamCommit)]
     assert commit.xid == starts[0].xid
+    # The rows of the rolled back savepoint carry its subxid; they are 1001 to 1160.
+    sub = aborts[0].subxid
+    rolled = sorted(int(x.new[0].text()) for x in m if isinstance(x, Insert) and x.xid == sub)
+    assert rolled and rolled == list(range(1001, 1001 + len(rolled)))
+    # ROLLBACK TO SAVEPOINT keeps the savepoint open: the later row has a third xid, neither the
+    # transaction's nor the aborted subtransaction's.
+    aborted = {a.subxid for a in aborts}
+    kept = [x for x in m if isinstance(x, Insert) and x.xid not in aborted]
+    assert any(x.new[1].text() == "streamed" for x in kept)
 
 
 @pytest.mark.parametrize("path", by_scenario("stream_parallel"), ids=_id)

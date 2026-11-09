@@ -31,7 +31,7 @@ jobs:
             postgres:${{ matrix.postgres }} \
             -c wal_level=logical -c max_prepared_transactions=10 -c max_replication_slots=20
           for i in $(seq 1 60); do
-            docker exec pg pg_isready -U postgres && break
+            docker exec pg pg_isready -h 127.0.0.1 -U postgres && break
             sleep 1
           done
           docker exec pg postgres --version
@@ -39,7 +39,7 @@ jobs:
         run: |
           python -m venv "$RUNNER_TEMP/published"
           "$RUNNER_TEMP/published/bin/pip" install --upgrade --no-cache-dir pgoutput pytest \
-            psycopg2-binary "psycopg[binary]"
+            psycopg2-binary "psycopg[binary]" asyncpg
           "$RUNNER_TEMP/published/bin/pip" show pgoutput
       - name: Live contract tests
         env:
@@ -47,4 +47,6 @@ jobs:
         run: |
           # Run the tests against the installed release, not the checkout.
           mv pgoutput "$RUNNER_TEMP/source-pgoutput"
+          "$RUNNER_TEMP/published/bin/python" -c \
+            "import pgoutput, sys; assert 'site-packages' in pgoutput.__file__, pgoutput.__file__; print(pgoutput.__version__, pgoutput.__file__)"
           "$RUNNER_TEMP/published/bin/python" -m pytest -q -p no:cacheprovider tests/integration

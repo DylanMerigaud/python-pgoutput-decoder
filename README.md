@@ -89,7 +89,7 @@ Update pgo.full_rows {'id': 1, 'note': 'uno'}
 import psycopg2
 import psycopg2.extras
 
-from pgoutput import Commit, Converter, Delete, Insert, Update
+from pgoutput import Commit, Converter, Delete, Insert, StreamCommit, Update
 from pgoutput.psycopg2 import ack, events, start
 
 conn = psycopg2.connect(dsn, connection_factory=psycopg2.extras.LogicalReplicationConnection)
@@ -98,18 +98,22 @@ cur.create_replication_slot("my_slot", output_plugin="pgoutput")
 start(cur, "my_slot", "my_pub", proto_version=2, streaming=True)
 
 converter = Converter()
-for event in events(cur):
+for event in events(cur, ack_idle=True):
     msg = event.message
     if isinstance(msg, (Insert, Update)):
         print(msg.relation.qualified_name, converter.row(msg.relation, msg.new))
     elif isinstance(msg, Delete):
         print("deleted", converter.row(msg.relation, msg.old))
-    elif isinstance(msg, Commit):
+    elif isinstance(msg, (Commit, StreamCommit)):
         ack(cur, msg.end_lsn)  # the slot may now release this WAL
 ```
 
-`ack` takes the `end_lsn` of a Commit once its changes are durable on your side. psycopg2
-handles keepalives inside `events`.
+`ack` takes the `end_lsn` of a Commit, Stream Commit or Commit Prepared once its changes are
+durable on your side. Since PostgreSQL 15 the server sends nothing for transactions that touch no
+published table, so a quiet publication on a busy server never gets a Commit to acknowledge:
+`ack_idle=True` acknowledges the server's position whenever the stream is idle and no
+transaction is open, which is right when you apply each message before reading the next one.
+psycopg2 handles keepalives inside `events`.
 
 ### Read a slot with SQL (psycopg 3, asyncpg, any driver)
 
@@ -129,8 +133,22 @@ with psycopg.connect(dsn, autocommit=True) as conn:
         print(change.lsn, change.xid, change.message)
 ```
 
-`peek=True` leaves the changes in the slot, `peek=False` consumes them. For asyncpg, build the
-query with `changes_query(..., paramstyle="numeric")` and decode the rows with `decode_rows`.
+`peek=True` leaves the changes in the slot, `peek=False` consumes them. Without streaming a
+batch always ends on a transaction boundary. With `streaming=True` and `upto_nchanges`, a batch
+can stop inside an uncommitted transaction, and the next call sends that transaction again from
+its first block: on the SQL path, stream only without `upto_nchanges`. For asyncpg, build the query with
+`changes_query(..., paramstyle="numeric")` and decode the rows with `decode_rows`:
+
+<!-- harness: skip -->
+```python
+# needs a live server
+import asyncpg
+from pgoutput.sql import changes_query, decode_rows
+
+conn = await asyncpg.connect(dsn)
+sql, params = changes_query("my_slot", "my_pub", paramstyle="numeric")
+changes = decode_rows(await conn.fetch(sql, *params))
+```
 
 ### Decode without state
 
@@ -173,7 +191,8 @@ conv.register(16385, text=str.upper)  # an extension type, by the OID a Type mes
 ```
 
 Unknown types come back as `str` (text format) or `bytes` (binary format). Text parsing assumes
-`DateStyle` ISO and `IntervalStyle` postgres, the defaults.
+`DateStyle` ISO and `IntervalStyle` postgres, the defaults. Binary `real` values are float32:
+`1.1` comes back as `1.100000023841858`, where the text format gives `1.1`.
 
 ### Vendor the decoder
 
@@ -234,12 +253,12 @@ pgoutput is built into the server and is what managed services and subscriptions
   in text and in binary format.
 - CI runs the live tests (`tests/integration`, `PGOUTPUT_TEST_DSN`) against PostgreSQL 14, 15,
   16, 17 and 18, including the psycopg2 streaming path with LSN acknowledgement and the SQL path
-  with psycopg2 and psycopg 3.
+  with psycopg2, psycopg 3 and asyncpg.
 - A weekly workflow installs the published package from PyPI and runs the same live tests
   against the newest PostgreSQL images, so a server change shows up the week it ships.
 
-`benchmarks/bench.py` times the decoder against pypgoutput on the same captured messages; on the
-messages both decode, the two run at about the same speed.
+`benchmarks/bench.py` times the decoder against pypgoutput on the captured messages both of them
+decode.
 
 ## Development
 

@@ -29,7 +29,9 @@ Text parsing assumes the defaults a replication session runs with: ``DateStyle``
 | arrays of the above | nested lists |
 
 ``infinity`` and ``-infinity`` dates and timestamps become the ``max`` and ``min`` of their
-Python type. A BC date, which Python cannot hold, comes back as the server's text.
+Python type; infinite intervals (PostgreSQL 17+) become ``INTERVAL_INFINITY`` and
+``INTERVAL_NEG_INFINITY``. A date Python cannot hold (BC, or past year 9999) comes back as a
+``str``: the server's text in text format, the day or microsecond count in binary format.
 """
 
 from __future__ import annotations
@@ -46,7 +48,15 @@ from typing import Any, Callable, Dict, List, Optional, Union
 
 from .core import Relation, TupleData, TupleKind, TupleValue
 
-__all__ = ["Converter", "Interval", "UNCHANGED_TOAST", "UnchangedToast", "oids"]
+__all__ = [
+    "Converter",
+    "Interval",
+    "INTERVAL_INFINITY",
+    "INTERVAL_NEG_INFINITY",
+    "UNCHANGED_TOAST",
+    "UnchangedToast",
+    "oids",
+]
 
 
 class UnchangedToast:
@@ -78,11 +88,22 @@ class Interval:
     days: int = 0
     microseconds: int = 0
 
+    @property
+    def is_infinite(self) -> bool:
+        return self in (INTERVAL_INFINITY, INTERVAL_NEG_INFINITY)
+
     def to_timedelta(self) -> timedelta:
-        """The interval as a timedelta; raises ValueError when it has months."""
+        """The interval as a timedelta; raises ValueError when it has months or is infinite."""
+        if self.is_infinite:
+            raise ValueError("an infinite interval has no timedelta")
         if self.months:
             raise ValueError("an interval with months has no fixed length")
         return timedelta(days=self.days, microseconds=self.microseconds)
+
+
+# PostgreSQL 17 adds infinite intervals: every field at its maximum (or minimum).
+INTERVAL_INFINITY = Interval(2**31 - 1, 2**31 - 1, 2**63 - 1)
+INTERVAL_NEG_INFINITY = Interval(-(2**31), -(2**31), -(2**63))
 
 
 class oids:  # noqa: N801  (a namespace of constants)
@@ -262,6 +283,10 @@ _INTERVAL_TIME = re.compile(r"([+-])?(\d+):(\d\d):(\d\d)(?:\.(\d{1,6}))?$")
 
 
 def _interval_text(s: str) -> Union[Interval, str]:
+    if s == "infinity":
+        return INTERVAL_INFINITY
+    if s == "-infinity":
+        return INTERVAL_NEG_INFINITY
     months = days = micros = 0
     for m in _INTERVAL_PART.finditer(s):
         n, unit = int(m.group(1)), m.group(2)
@@ -336,7 +361,15 @@ def _parse_array_text(s: str, element: Callable[[str], Any]) -> Any:
     return parse()
 
 
+def _char_text(s: str) -> str:
+    # "char" is one raw byte; charout prints a byte above 127 as \ooo.
+    if len(s) == 4 and s[0] == "\\":
+        return chr(int(s[1:], 8))
+    return s
+
+
 TEXT_PARSERS: Dict[int, TextParser] = {
+    oids.CHAR: _char_text,
     oids.BOOL: _bool_text,
     oids.BYTEA: _bytea_text,
     oids.INT2: int,
@@ -444,11 +477,14 @@ def _numeric_bin(b: bytes) -> Decimal:
     if len(b) != 8 + 2 * ndigits:
         raise ValueError(f"numeric with {ndigits} digits expects {8 + 2 * ndigits} bytes")
     digits = struct.unpack(f">{ndigits}H", b[8:])
-    text = "".join(f"{d:04d}" for d in digits) or "0"
-    # The first base 10000 digit sits at 10000**weight.
-    exponent = (weight - ndigits + 1) * 4
-    value = Decimal(f"{'-' if sign == _NUMERIC_NEG else ''}{text}E{exponent}")
-    return value.quantize(Decimal(1).scaleb(-dscale)) if dscale >= 0 else value
+    coef = 0
+    for d in digits:
+        coef = coef * 10000 + d
+    # The first base 10000 digit sits at 10000**weight; the value is shown with dscale decimals.
+    # Built from its digits, never through a decimal context, so no precision limit applies.
+    shift = (weight - ndigits + 1) * 4 + dscale
+    coef = coef * 10**shift if shift >= 0 else coef // 10**-shift
+    return Decimal((1 if sign == _NUMERIC_NEG else 0, tuple(int(c) for c in str(coef)), -dscale))
 
 
 def _jsonb_bin(b: bytes) -> Any:
@@ -497,9 +533,11 @@ BINARY_PARSERS: Dict[int, BinaryParser] = {
     oids.CIDR: _inet_bin,
     # cash_send: an int64 count of the currency's smallest unit (cents for lc_monetary en_US).
     oids.MONEY: lambda b: _unpack(">q", b),
+    # "char" is one raw byte, the same character the text format's \ooo escape names.
+    oids.CHAR: lambda b: bytes(b).decode("latin-1"),
 }
 
-_TEXT_LIKE = (oids.TEXT, oids.VARCHAR, oids.BPCHAR, oids.NAME, oids.CHAR, oids.XML)
+_TEXT_LIKE = (oids.TEXT, oids.VARCHAR, oids.BPCHAR, oids.NAME, oids.XML)
 
 
 class Converter:

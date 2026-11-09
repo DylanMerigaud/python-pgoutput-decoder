@@ -10,7 +10,7 @@ The server needs wal_level=logical, and a publication: CREATE PUBLICATION my_pub
 import contextlib
 import os
 
-from pgoutput import Commit, Converter, Delete, Insert, Update
+from pgoutput import Commit, Converter, Delete, Insert, StreamCommit, Update
 
 DSN = os.environ.get("PGOUTPUT_DSN")
 
@@ -27,7 +27,9 @@ def main(dsn: str) -> None:
         cur.create_replication_slot("pgoutput_example", output_plugin="pgoutput")
     start(cur, "pgoutput_example", "my_pub", proto_version=2, streaming=True)
     converter = Converter()
-    for event in events(cur):
+    # Each message is handled before the next one is read, so ack_idle may acknowledge the
+    # server's position between transactions: the slot keeps moving on a quiet publication.
+    for event in events(cur, ack_idle=True):
         msg = event.message
         if isinstance(msg, (Insert, Update)):
             print(
@@ -37,7 +39,7 @@ def main(dsn: str) -> None:
             )
         elif isinstance(msg, Delete):
             print("Delete", msg.relation.qualified_name, converter.row(msg.relation, msg.old))
-        elif isinstance(msg, Commit):
+        elif isinstance(msg, (Commit, StreamCommit)):
             ack(cur, msg.end_lsn)
 
 

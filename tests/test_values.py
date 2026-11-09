@@ -774,3 +774,35 @@ def test_row_column_count_mismatch():
         CONV.row(rel, TupleData((TupleValue("t", b"1"),)))
     with pytest.raises(ValueError):
         CONV.row(rel, TupleData((TupleValue("n"), TupleValue("n"), TupleValue("n"))))
+
+
+def test_binary_numeric_beyond_28_digits_is_exact():
+    # 1e30 as numeric(31,0): one base-10000 digit, 1, at weight 7, then 10**28 more.
+    assert to_bin(1700, numeric(1, 7, 0x0000, 0, [100])) == Decimal("1E30")
+    big = numeric(10, 7, 0x0000, 10, [1234, 5678, 9012, 3456, 7890, 1234, 5678, 9123, 4567, 8900])
+    assert str(to_bin(1700, big)) == "12345678901234567890123456789123.4567890000"
+    neg = numeric(2, 0, 0x4000, 2, [1, 5000])
+    assert str(to_bin(1700, neg)) == "-1.50"
+
+
+def test_binary_numeric_array_with_a_big_value():
+    elem = numeric(1, 7, 0x0000, 0, [100])
+    arr = struct.pack(">iiIii", 1, 0, 1700, 1, 1) + struct.pack(">i", len(elem)) + elem
+    assert to_bin(1231, arr) == [Decimal("1E30")]
+
+
+def test_infinite_intervals_are_the_same_in_both_formats():
+    from pgoutput.values import INTERVAL_INFINITY, INTERVAL_NEG_INFINITY
+
+    pos = struct.pack(">qii", 2**63 - 1, 2**31 - 1, 2**31 - 1)
+    neg = struct.pack(">qii", -(2**63), -(2**31), -(2**31))
+    assert to_text(1186, "infinity") == to_bin(1186, pos) == INTERVAL_INFINITY
+    assert to_text(1186, "-infinity") == to_bin(1186, neg) == INTERVAL_NEG_INFINITY
+    assert INTERVAL_INFINITY.is_infinite
+    with pytest.raises(ValueError):
+        INTERVAL_INFINITY.to_timedelta()
+
+
+def test_char_type_is_one_byte_in_both_formats():
+    assert to_text(18, "a") == to_bin(18, b"a") == "a"
+    assert to_text(18, "\\303") == to_bin(18, b"\xc3") == "\xc3"
