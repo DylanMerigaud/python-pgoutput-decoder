@@ -1,6 +1,6 @@
 """Stream a pgoutput slot with psycopg2's replication protocol support.
 
-psycopg2 (2.8+) speaks the streaming replication protocol through
+psycopg2 (2.8.3+) speaks the streaming replication protocol through
 ``psycopg2.extras.LogicalReplicationConnection``; psycopg 3 does not yet (psycopg issue 71), so
 with psycopg 3 or asyncpg use ``pgoutput.sql`` instead. psycopg2 is not a dependency of this
 package: this module takes the cursor you created.
