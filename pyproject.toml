@@ -1,0 +1,55 @@
+[build-system]
+requires = ["hatchling>=1.18"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pgoutput"
+dynamic = ["version"]
+description = "Decode PostgreSQL logical replication (pgoutput, protocol 1 to 4) into typed Python dataclasses, no dependencies"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Dylan Merigaud" }]
+keywords = ["postgresql", "postgres", "logical-replication", "pgoutput", "cdc", "change-data-capture", "wal", "replication"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Database",
+    "Typing :: Typed",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/DylanMerigaud/python-pgoutput-decoder"
+Source = "https://github.com/DylanMerigaud/python-pgoutput-decoder"
+Issues = "https://github.com/DylanMerigaud/python-pgoutput-decoder/issues"
+Changelog = "https://github.com/DylanMerigaud/python-pgoutput-decoder/blob/main/CHANGELOG.md"
+
+[project.optional-dependencies]
+psycopg2 = ["psycopg2-binary>=2.8"]
+test = ["pytest>=7"]
+dev = ["pytest>=7", "ruff", "mypy", "psycopg2-binary>=2.8"]
+
+[tool.hatch.version]
+path = "pgoutput/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["pgoutput"]
+
+[tool.hatch.build.targets.sdist]
+include = ["/pgoutput", "/tests", "/docs", "/examples", "/tools", "/benchmarks", "/README.md", "/LICENSE", "/CHANGELOG.md", "/CONTRIBUTING.md", "/ruff.toml"]
+
+[tool.mypy]
+strict = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install
+        run: python -m pip install -e ".[dev]"
+      - name: Lint
+        run: |
+          ruff check .
+          ruff format --check .
+      - name: Type check
+        run: mypy pgoutput
+      - name: Tests
+        run: python -m pytest -q
+
+  postgres:
+    # The live tests and a fresh capture against every supported major version.
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres: ["14", "15", "16", "17", "18"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Start PostgreSQL ${{ matrix.postgres }}
+        run: |
+          docker run -d --name pg -p 5432:5432 -e POSTGRES_HOST_AUTH_METHOD=trust \
+            postgres:${{ matrix.postgres }} \
+            -c wal_level=logical -c max_prepared_transactions=10 -c max_replication_slots=20
+          for i in $(seq 1 60); do
+            docker exec pg pg_isready -U postgres && break
+            sleep 1
+          done
+      - name: Install
+        run: python -m pip install -e ".[dev]" "psycopg[binary]"
+      - name: Live tests
+        env:
+          PGOUTPUT_TEST_DSN: "host=127.0.0.1 port=5432 user=postgres dbname=postgres"
+        run: python -m pytest -q tests/integration
+      - name: A fresh capture decodes to the same messages as the stored fixtures
+        run: |
+          python tools/capture.py "host=127.0.0.1 port=5432 user=postgres dbname=postgres" \
+            "fresh/pg${{ matrix.postgres }}"
+          python tools/compare_fixtures.py "fresh/pg${{ matrix.postgres }}" \
+            "tests/fixtures/pg${{ matrix.postgres }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fixtures-pg${{ matrix.postgres }}
+          path: fresh/pg${{ matrix.postgres }}
+
+  wheel-examples:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build the wheel
+        run: |
+          python -m pip install build
+          python -m build
+      - name: Install it in a fresh virtual environment
+        run: |
+          python -m venv /tmp/fresh
+          /tmp/fresh/bin/python -m pip install dist/*.whl
+      - name: Run the examples
+        working-directory: /tmp
+        run: |
+          for example in "$GITHUB_WORKSPACE"/examples/*.py; do
+            echo "== $example"
+            OSS_LIB_OFFLINE=1 /tmp/fresh/bin/python "$example"
+          done
